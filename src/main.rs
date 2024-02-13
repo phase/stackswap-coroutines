@@ -4,7 +4,7 @@ use setjmp::*;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::thread_local;
+use std::{ptr, thread_local};
 
 thread_local! {
     static CURRENT: RefCell<Option<*mut Stack>> = RefCell::new(None);
@@ -33,25 +33,7 @@ impl Dispatcher {
         }
     }
 
-    pub fn block(&self) {
-        CURRENT.with(|current| unsafe {
-            if let Ok(mut current) = current.try_borrow_mut() {
-                if let Some(current) = current.as_mut() {
-                    let current = *current;
-                    let mut jmpbuf: MaybeUninit<jmp_buf> = MaybeUninit::uninit();
-                    if setjmp(jmpbuf.as_mut_ptr()) == 0 {
-                        (*current).continue_jmpbuf = jmpbuf.as_mut_ptr();
-                        (*current).top = (*current)
-                            .continue_jmpbuf
-                            .with_addr((*current).continue_jmpbuf.addr() - 32)
-                            as *mut c_void;
-                        longjmp(self.jmpbuf, 1);
-                    }
-                }
-            }
-        });
-    }
-
+    #[inline(never)]
     pub fn run(&mut self) {
         let mut jmpbuf: MaybeUninit<jmp_buf> = MaybeUninit::uninit();
         unsafe {
@@ -65,12 +47,21 @@ impl Dispatcher {
             CURRENT.with(|current| {
                 if let Ok(mut current) = current.try_borrow_mut() {
                     (*current) = Some(stack);
+                } else {
+                    panic!("failed to borrow current");
                 }
             });
 
             // continue/launch the stack
             if let Some(_) = (*stack).bottom {
+                let id = stack.id;
+
                 stack.cont();
+
+                self.stacks.retain(|x| x.id != id);
+                if self.current_stack > 0 {
+                    self.current_stack -= 1;
+                }
             } else {
                 stack.launch();
             }
@@ -79,24 +70,21 @@ impl Dispatcher {
             CURRENT.with(|current| {
                 if let Ok(mut current) = current.try_borrow_mut() {
                     (*current) = None;
+                } else {
+                    panic!("failed to borrow current");
                 }
             });
         }
     }
 
     pub fn next(&mut self) -> Option<&mut Stack> {
+        if self.stacks.len() == 0 {
+            return None;
+        }
         let next_idx = (self.current_stack + 1) % self.stacks.len();
         let stack = self.stacks.get_mut(self.current_stack);
         self.current_stack = next_idx;
         stack
-    }
-
-    pub fn launch(&mut self, _stack: &mut Stack) {
-        println!("start stack");
-        for i in 0..10 {
-            println!("{}", i);
-            self.block();
-        }
     }
 }
 
@@ -114,55 +102,74 @@ pub struct StackBuffer {
 }
 
 pub struct Stack {
+    id: u64,
+    dispatcher: *mut Dispatcher,
     pub bottom: Option<*mut c_void>,
     top: *mut c_void,
     stack_buffer: Option<StackBuffer>,
     continue_jmpbuf: *mut jmp_buf,
+    program: Option<Box<dyn FnOnce(&mut Stack)>>,
 }
 
 impl Stack {
-    pub fn new() -> Self {
+    pub fn new(id: u64, dispatcher: *mut Dispatcher, program: Box<dyn FnOnce(&mut Stack)>) -> Self {
         Self {
+            id,
+            dispatcher,
             bottom: None,
             top: std::ptr::null_mut(),
             stack_buffer: None,
             continue_jmpbuf: std::ptr::null_mut(),
+            program: Some(program),
         }
     }
 
+    #[inline(never)]
     pub fn stack_in(&mut self) {
         if let Some(stack_buffer) = &self.stack_buffer {
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    self.top,
                     stack_buffer.loc,
-                    self.bottom.unwrap_unchecked().addr() - self.top.addr(),
+                    self.top,
+                    self.bottom.unwrap().addr() - self.top.addr(),
                 );
             }
+        } else {
+            panic!("stack_in: no stack buffer for stack {}", self.id);
         }
     }
 
-    pub fn stack_out(&mut self, dispatcher: &Dispatcher) {
-        let used = unsafe { self.bottom.unwrap_unchecked() }.addr() - self.top.addr();
+    #[inline(never)]
+    pub fn stack_out(&mut self) {
+        let used = self.bottom.unwrap().addr() - self.top.addr();
+        assert!(
+            self.bottom.unwrap().addr() > self.top.addr(),
+            "used must be greater than 0"
+        );
         if let Some(stack_buffer) = self.stack_buffer.take() {
             if stack_buffer.len < used {
-                dispatcher.allocator.free(stack_buffer);
+                unsafe {
+                    (*self.dispatcher).allocator.free(stack_buffer);
+                }
             } else {
                 self.stack_buffer = Some(stack_buffer);
             }
         }
         if let None = &self.stack_buffer {
-            self.stack_buffer = Some(dispatcher.allocator.alloc(used));
+            // allocate a new stack buffer
+            // eprintln!(
+            //     "requesting stack buffer of size {} for stack {}",
+            //     used, self.id
+            // );
+            self.stack_buffer = Some(unsafe { (*self.dispatcher).allocator.alloc(used) });
         }
+
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.stack_buffer.as_ref().unwrap_unchecked().loc,
-                self.top,
-                used,
-            );
+            std::ptr::copy_nonoverlapping(self.top, self.stack_buffer.as_ref().unwrap().loc, used);
         }
     }
 
+    #[inline(never)]
     pub fn cont(&mut self) {
         self.stack_in();
         unsafe {
@@ -170,10 +177,30 @@ impl Stack {
         }
     }
 
+    #[inline(never)]
     pub fn launch(&mut self) {
         // pad the stack to prevent stack_in() from smashing the frame
-        let mut padding = [0u8; 300];
+        let mut padding = [0u8; 512];
         self.bottom = Some(padding.as_mut_ptr() as *mut c_void);
+        if let Some(program) = self.program.take() {
+            program(self);
+        }
+    }
+
+    #[inline(never)]
+    pub fn block(&mut self) {
+        unsafe {
+            let mut jmpbuf: MaybeUninit<jmp_buf> = MaybeUninit::uninit();
+            if setjmp(jmpbuf.as_mut_ptr()) == 0 {
+                self.continue_jmpbuf = jmpbuf.as_mut_ptr();
+                self.top = self
+                    .continue_jmpbuf
+                    .with_addr(self.continue_jmpbuf.addr() - 32)
+                    as *mut c_void;
+                self.stack_out();
+                longjmp((*self.dispatcher).jmpbuf, 1);
+            }
+        }
     }
 }
 
@@ -195,8 +222,34 @@ impl StackBufferAllocator for HeapAllocator {
     }
 }
 
+fn test_coroutine(stack: &mut Stack, counter: *mut u64) {
+    unsafe {
+        loop {
+            if *counter >= 200_000_000 {
+                return;
+            }
+            *counter += 1;
+            if *counter % 500_000 == 0 {
+                eprintln!("{}: {}", stack.id, *counter);
+            }
+            stack.block();
+        }
+    }
+}
+
 fn main() {
     println!("Launching Dispatcher.");
     let mut dispatcher = Dispatcher::new(Box::new(HeapAllocator));
+    let d = &mut dispatcher as *mut Dispatcher;
+    let mut counter = Box::new(0u64);
+    let counter_ptr = counter.as_mut() as *mut u64;
+    for i in 0..10_000_000 {
+        let stack = Stack::new(
+            i,
+            d,
+            Box::new(move |stack| test_coroutine(stack, counter_ptr)),
+        );
+        dispatcher.stacks.push(stack);
+    }
     dispatcher.run();
 }
