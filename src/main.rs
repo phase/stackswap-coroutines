@@ -4,7 +4,7 @@ use setjmp::*;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::{ptr, thread_local};
+use std::thread_local;
 
 thread_local! {
     static CURRENT: RefCell<Option<*mut Stack>> = RefCell::new(None);
@@ -44,18 +44,17 @@ impl Dispatcher {
         // while we have a stack to use
         while let Some(stack) = self.next() {
             // set this stack as the current
-            CURRENT.with(|current| {
-                if let Ok(mut current) = current.try_borrow_mut() {
-                    (*current) = Some(stack);
-                } else {
-                    panic!("failed to borrow current");
-                }
-            });
+            // CURRENT.with(|current| {
+            //     if let Ok(mut current) = current.try_borrow_mut() {
+            //         (*current) = Some(stack);
+            //     } else {
+            //         panic!("failed to borrow current");
+            //     }
+            // });
 
             // continue/launch the stack
+            let id = stack.id;
             if let Some(_) = (*stack).bottom {
-                let id = stack.id;
-
                 stack.cont();
 
                 self.stacks.retain(|x| x.id != id);
@@ -67,13 +66,13 @@ impl Dispatcher {
             }
 
             // set the current to none
-            CURRENT.with(|current| {
-                if let Ok(mut current) = current.try_borrow_mut() {
-                    (*current) = None;
-                } else {
-                    panic!("failed to borrow current");
-                }
-            });
+            // CURRENT.with(|current| {
+            //     if let Ok(mut current) = current.try_borrow_mut() {
+            //         (*current) = None;
+            //     } else {
+            //         panic!("failed to borrow current");
+            //     }
+            // });
         }
     }
 
@@ -171,7 +170,12 @@ impl Stack {
 
     #[inline(never)]
     pub fn cont(&mut self) {
+        // maybe the stack has two things here?
+        // 1. a value to stuff once the stack is in
+        // 2. a location to stuff the value
+        // The location is only valid _after_ the stack is in.
         self.stack_in();
+        // TODO: insert continuation value on the stack here
         unsafe {
             longjmp(self.continue_jmpbuf, 1);
         }
@@ -225,13 +229,11 @@ impl StackBufferAllocator for HeapAllocator {
 fn test_coroutine(stack: &mut Stack, counter: *mut u64) {
     unsafe {
         loop {
-            if *counter >= 200_000_000 {
+            if *counter >= 6 {
                 return;
             }
             *counter += 1;
-            if *counter % 500_000 == 0 {
-                eprintln!("{}: {}", stack.id, *counter);
-            }
+            eprintln!("{}: {}", stack.id, *counter);
             stack.block();
         }
     }
@@ -243,7 +245,7 @@ fn main() {
     let d = &mut dispatcher as *mut Dispatcher;
     let mut counter = Box::new(0u64);
     let counter_ptr = counter.as_mut() as *mut u64;
-    for i in 0..10_000_000 {
+    for i in 0..5 {
         let stack = Stack::new(
             i,
             d,
