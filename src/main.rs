@@ -18,6 +18,7 @@ pub struct Dispatcher {
 impl Dispatcher {
     pub fn new(allocator: Box<dyn StackBufferAllocator>) -> Self {
         Self {
+            #[allow(dangling_pointers_from_temporaries)]
             jmpbuf: MaybeUninit::uninit().as_mut_ptr(),
             allocator,
             stacks: Vec::new(),
@@ -43,6 +44,9 @@ impl Dispatcher {
         while let Some(stack) = self.next() {
             if stack.is_complete {
                 self.stacks.remove(self.current_stack);
+                if self.current_stack >= self.stacks.len() && !self.stacks.is_empty() {
+                    self.current_stack = 0;
+                }
                 continue;
             }
             // set this stack as the current
@@ -73,13 +77,13 @@ impl Dispatcher {
     }
 
     pub fn next(&mut self) -> Option<&mut Stack> {
-        if self.stacks.len() == 0 {
+        if self.stacks.is_empty() {
             return None;
         }
-        let next_idx = (self.current_stack + 1) % self.stacks.len();
-        let stack = self.stacks.get_mut(self.current_stack);
-        self.current_stack = next_idx;
-        stack
+        if self.stacks.len() > 1 {
+            self.current_stack = (self.current_stack + 1) % self.stacks.len();
+        }
+        self.stacks.get_mut(self.current_stack)
     }
 }
 
@@ -146,9 +150,7 @@ impl Stack {
 
         if let Some(stack_buffer) = self.stack_buffer.take() {
             if stack_buffer.len < used {
-                unsafe {
-                    (*self.dispatcher).allocator.free(stack_buffer);
-                }
+                self.stack_buffer = None;
             } else {
                 self.stack_buffer = Some(stack_buffer);
             }
@@ -178,12 +180,10 @@ impl Stack {
 
     #[inline(never)]
     pub fn launch(&mut self) {
-        // Increase padding to be safe
-        let mut padding = [0u8; 1024];
+        let mut padding = [0u8; 64];
         self.bottom = Some(padding.as_mut_ptr() as *mut c_void);
         if let Some(program) = self.program.take() {
             program(self);
-            // Don't save the stack state when we're done
             self.bottom = None;
             self.is_complete = true;
         }
@@ -245,8 +245,8 @@ impl StackBufferAllocator for HeapAllocator {
             std::alloc::handle_alloc_error(layout);
         }
 
-        let count = self.allocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        eprintln!("Allocating buffer {} at {:p}", count + 1, ptr);
+        let _count = self.allocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // eprintln!("Allocating buffer {} at {:p}", count + 1, ptr);
 
         StackBuffer {
             loc: ptr as *mut c_void,
@@ -256,14 +256,14 @@ impl StackBufferAllocator for HeapAllocator {
 
     fn free(&self, stack_buffer: StackBuffer) {
         let current = self.allocations.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // eprintln!("Freeing buffer {} at {:p}", current, stack_buffer.loc);
         if current == 0 {
             eprintln!("Warning: Attempting to free buffer at {:p} when allocation count is 0",
                      stack_buffer.loc);
             self.allocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return;
         }
-
-        eprintln!("Freeing buffer {} at {:p}", current, stack_buffer.loc);
 
         let len = (stack_buffer.len + 15) & !15;
         unsafe {
@@ -275,21 +275,28 @@ impl StackBufferAllocator for HeapAllocator {
 }
 
 fn test_coroutine(stack: &mut Stack, counter: *mut u64) {
+    let mut runs = 0u64;
     let mut local = 0u64;
+    let mut growing_vec = Vec::new();
+
     unsafe {
         loop {
             if *counter >= 1_000_000 {
                 *counter += 1;
                 if *counter % 1_000 == 0 {
-                    eprintln!("DONEstack {} | local:{} counter:{}", stack.id, local, *counter);
+                    eprintln!("stack {} | local:{} counter:{} vec_size:{} (DONE)",
+                        stack.id, local, *counter, growing_vec.len());
                 }
                 return;
             } else if *counter % 10_000 == 0 {
-                eprintln!("stack {} | local:{} counter:{}", stack.id, local, *counter);
+                eprintln!("stack {} | local:{} counter:{} vec_size:{}",
+                    stack.id, local, *counter, growing_vec.len());
             }
 
+            growing_vec.push(runs);
             local += *counter / 2;
             *counter += 1;
+            runs += 1;
             stack.block();
         }
     }
@@ -301,7 +308,7 @@ fn main() {
     let d = &mut dispatcher as *mut Dispatcher;
     let mut counter = Box::new(0u64);
     let counter_ptr = counter.as_mut() as *mut u64;
-    for i in 0..4 {
+    for i in 0..24_351 {
         let stack = Stack::new(
             i,
             d,
