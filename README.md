@@ -1,5 +1,3 @@
 # stackswap coroutines
 
-Coroutines implemented by swapping between stacks.
-
-A reimplementation of some parts of [usched](https://github.com/nikitadanilov/usched) in Rust.
+Coroutines implemented by swapping between stacks. Insipred by [usched](https://github.com/nikitadanilov/usched).

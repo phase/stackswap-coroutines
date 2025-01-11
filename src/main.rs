@@ -89,7 +89,8 @@ impl Dispatcher {
             }
 
             // Check if child is complete
-            let child_exists = self.stacks.iter().any(|s| s.id == child_id && !s.is_complete);
+            let child_exists = self.stacks.iter()
+                .any(|s| s.id == child_id && !s.is_complete);
             if !child_exists {
                 let stack = &mut self.stacks[current];
                 stack.waiting_on = None;
@@ -161,11 +162,17 @@ impl Stack {
     #[inline(never)]
     pub fn stack_in(&mut self) {
         if let Some(stack_buffer) = &self.stack_buffer {
+            let bottom = self.bottom.expect("No bottom pointer set in stack_in");
+            let used = bottom.addr() - self.top.addr();
+
+            assert!(used > 0, "Invalid stack size in stack_in");
+            assert!(used <= stack_buffer.len, "Buffer overflow in stack_in");
+
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     stack_buffer.loc,
                     self.top,
-                    self.bottom.unwrap().addr() - self.top.addr(),
+                    used
                 );
             }
         } else {
@@ -175,25 +182,29 @@ impl Stack {
 
     #[inline(never)]
     pub fn stack_out(&mut self) {
-        let used = self.bottom.unwrap().addr() - self.top.addr();
+        let bottom = self.bottom.expect("No bottom pointer set");
+        let used = bottom.addr() - self.top.addr();
         assert!(used > 0, "Stack underflow detected");
-        assert!(used < 1024 * 1024, "Stack overflow detected"); // 1MB limit
+
+        // Add more padding to buffer
+        let required_size = used + 64; // More padding
 
         // Ensure we have enough buffer space
-        if self.stack_buffer.as_ref().map_or(true, |buf| buf.len < used) {
+        if self.stack_buffer.as_ref().map_or(true, |buf| buf.len < required_size) {
             if let Some(old_buf) = self.stack_buffer.take() {
                 unsafe {
                     (*self.dispatcher).allocator.free(old_buf);
                 }
             }
-            // Add extra padding to buffer
+
             self.stack_buffer = Some(unsafe {
-                (*self.dispatcher).allocator.alloc(used + 1024)
+                (*self.dispatcher).allocator.alloc(required_size)
             });
         }
 
         unsafe {
             let buffer = self.stack_buffer.as_ref().unwrap();
+            assert!(buffer.len >= used, "Buffer too small for stack");
             std::ptr::copy_nonoverlapping(
                 self.top,
                 buffer.loc,
@@ -225,8 +236,10 @@ impl Stack {
             program(self);
             self.bottom = None;
             self.is_complete = true;
+
             // Make sure we return to dispatcher after completion
             unsafe {
+                assert!(!(*self.dispatcher).jmpbuf.is_null(), "Invalid dispatcher jmpbuf");
                 longjmp((*self.dispatcher).jmpbuf, 1);
             }
         }
@@ -239,26 +252,33 @@ impl Stack {
             if setjmp(jmpbuf.as_mut_ptr()) == 0 {
                 self.continue_jmpbuf = jmpbuf.as_mut_ptr();
 
-                // Increase stack padding significantly
-                const STACK_PADDING: usize = 1024;  // 1KB padding
-                self.top = self
-                    .continue_jmpbuf
-                    .with_addr(self.continue_jmpbuf.addr() - STACK_PADDING)
-                    as *mut c_void;
+                const STACK_PADDING: usize = 64;
+                let frame_addr = self.continue_jmpbuf.addr();
+                assert!(frame_addr >= STACK_PADDING, "Stack frame address too low");
 
-                // Ensure stack alignment
-                self.top = self.top.with_addr(
-                    (self.top.addr() + 15) & !15
-                ) as *mut c_void;
+                // Calculate aligned top with padding
+                let unaligned_top = frame_addr - STACK_PADDING;
+                let aligned_top = (unaligned_top + 15) & !15;
+                self.top = (aligned_top as *mut c_void).cast();
 
-                // Verify our stack invariants
-                assert!(self.top.addr() % 16 == 0, "Stack must be 16-byte aligned");
-                assert!(
-                    self.bottom.unwrap().addr() > self.top.addr(),
-                    "Stack overflow detected"
-                );
+                // Additional safety checks
+                if let Some(bottom) = self.bottom {
+                    let available_space = bottom.addr() - self.top.addr();
+                    assert!(available_space >= STACK_PADDING,
+                        "Insufficient stack space: {} bytes", available_space);
+                    assert!(bottom.addr() > self.top.addr(),
+                        "Stack overflow detected: bottom={:p} top={:p}", bottom, self.top);
+                }
+
+                assert!(self.top.addr() % 16 == 0,
+                    "Stack misaligned: {:p}", self.top);
 
                 self.stack_out();
+
+                // Verify dispatcher pointer before jump
+                assert!(!(*self.dispatcher).jmpbuf.is_null(),
+                    "Invalid dispatcher jmpbuf before longjmp");
+
                 longjmp((*self.dispatcher).jmpbuf, 1);
             }
         }
@@ -340,8 +360,17 @@ impl HeapAllocator {
 
 impl StackBufferAllocator for HeapAllocator {
     fn alloc(&self, len: usize) -> StackBuffer {
+        // Ensure minimum allocation size
+        let min_size = 4096;
+        let len = std::cmp::max(len, min_size);
+
+        // Align to 16 bytes
         let len = (len + 15) & !15;
-        let layout = std::alloc::Layout::from_size_align(len, 16).expect("Failed to create layout");
+
+        // Use Layout for proper alignment
+        let layout = std::alloc::Layout::from_size_align(len, 16)
+            .expect("Failed to create layout");
+
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
@@ -372,78 +401,41 @@ impl StackBufferAllocator for HeapAllocator {
     }
 }
 
-fn test_coroutine(stack: &mut Stack, counter: *mut u64) {
-    let mut runs = 0u64;
-    let mut local = 0u64;
-    let mut growing_vec = Vec::new();
-
-    unsafe {
-        loop {
-            if *counter >= 1_000_000 {
-                *counter += 1;
-                if *counter % 1_000 == 0 {
-                    eprintln!(
-                        "stack {} | local:{} counter:{} vec_size:{} (DONE)",
-                        stack.id,
-                        local,
-                        *counter,
-                        growing_vec.len()
-                    );
-                }
-                return;
-            } else if *counter % 10_000 == 0 {
-                eprintln!(
-                    "stack {} | local:{} counter:{} vec_size:{}",
-                    stack.id,
-                    local,
-                    *counter,
-                    growing_vec.len()
-                );
-            }
-
-            growing_vec.push(runs);
-            local += *counter / 2;
-            *counter += 1;
-            runs += 1;
-            stack.block();
-        }
-    }
-}
-
-fn number_sequence(stack: &mut Stack) {
-    println!("Starting number_sequence");
-    for i in 0..5 {
-        println!("Yielding value: {}", i);
-        stack.yield_value(i as YieldValue);
-        println!("After yield: {}", i);
-    }
-    println!("Ending number_sequence");
-}
-
-fn parent_routine(stack: &mut Stack) {
-    println!("Starting parent_routine");
-    let child_id = stack.spawn(number_sequence);
-    println!("Spawned child with id: {}", child_id);
-
-    while let Some(value) = stack.get_yielded(child_id) {
-        println!("Parent received value: {}", value);
-    }
-    println!("Parent ending");
-}
-
-fn main() {
-    println!("Launching Dispatcher.");
-    let mut dispatcher = Dispatcher::new(Box::new(HeapAllocator::new()));
-    let d = &mut dispatcher as *mut Dispatcher;
-
-    let stack = Stack::new(0, d, Box::new(parent_routine));
-    dispatcher.stacks.push(stack);
-    dispatcher.run();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn number_sequence(stack: &mut Stack) {
+        println!("Starting number_sequence");
+        for i in 0..5 {
+            println!("Yielding value: {}", i);
+            stack.yield_value(i as YieldValue);
+            println!("After yield: {}", i);
+        }
+        println!("Ending number_sequence");
+    }
+
+    fn parent_routine(stack: &mut Stack) {
+        println!("Starting parent_routine");
+        let child_id = stack.spawn(number_sequence);
+        println!("Spawned child with id: {}", child_id);
+
+        while let Some(value) = stack.get_yielded(child_id) {
+            println!("Parent received value: {}", value);
+        }
+        println!("Parent ending");
+    }
+
+    #[test]
+    fn test_parent_child_sequence() {
+        println!("Launching Dispatcher.");
+        let mut dispatcher = Dispatcher::new(Box::new(HeapAllocator::new()));
+        let d = &mut dispatcher as *mut Dispatcher;
+
+        let stack = Stack::new(0, d, Box::new(parent_routine));
+        dispatcher.stacks.push(stack);
+        dispatcher.run();
+    }
 
     #[test]
     fn test_simple_yield_sequence() {
@@ -615,7 +607,7 @@ mod tests {
                     let max_stack_size = recursive_stack_growth(s, 0, depth, &mut array);
 
                     // Print stack info after allocation
-                    let (final_size, final_info) = get_stack_info(s);
+                    let (_final_size, final_info) = get_stack_info(s);
                     println!("After allocation {}: {}", i, final_info);
                     println!("Created {} stack frames, max stack size: {} bytes (grew by: {} bytes)",
                         depth,
@@ -644,5 +636,70 @@ mod tests {
         dispatcher.stacks.push(stack);
         dispatcher.run();
     }
+
+    fn test_coroutine(stack: &mut Stack, counter: *mut u64) {
+        let mut runs = 0u64;
+        let mut local = 0u64;
+        let mut growing_vec = Vec::new();
+
+        unsafe {
+            loop {
+                if *counter >= 1_000_000 {
+                    *counter += 1;
+                    if *counter % 1_000 == 0 {
+                        eprintln!(
+                            "stack {} | local:{} counter:{} vec_size:{} (DONE)",
+                            stack.id,
+                            local,
+                            *counter,
+                            growing_vec.len()
+                        );
+                    }
+                    return;
+                } else if *counter % 10_000 == 0 {
+                    eprintln!(
+                        "stack {} | local:{} counter:{} vec_size:{}",
+                        stack.id,
+                        local,
+                        *counter,
+                        growing_vec.len()
+                    );
+                }
+
+                growing_vec.push(runs);
+                local += *counter / 2;
+                *counter += 1;
+                runs += 1;
+                stack.block();
+            }
+        }
+    }
+
+    #[test]
+    fn test_counter_coroutine() {
+        let mut dispatcher = Dispatcher::new(Box::new(HeapAllocator::new()));
+        let d = &mut dispatcher as *mut Dispatcher;
+
+        let counter = Box::into_raw(Box::new(0u64));
+
+        // Create multiple coroutines all sharing the counter
+        let num_coroutines = 4_000;
+        for i in 0..num_coroutines {
+            let counter_ptr = counter; // Share the same counter pointer
+            let stack = Stack::new(i, d, Box::new(move |s| test_coroutine(s, counter_ptr)));
+            dispatcher.stacks.push(stack);
+        }
+
+        dispatcher.run();
+
+        unsafe {
+            let final_count = *counter;
+            drop(Box::from_raw(counter));
+            assert!(final_count >= 1_000_000, "Counter should reach at least 1,000,000");
+        }
+    }
 }
 
+fn main() {
+    // todo
+}
